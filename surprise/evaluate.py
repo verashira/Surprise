@@ -15,6 +15,9 @@ from itertools import product
 from . import accuracy
 from .dump import dump
 
+from sklearn.externals.joblib import Parallel, delayed
+from sklearn.model_selection import ParameterSampler
+
 
 def evaluate(algo, data, measures=['rmse', 'mae'], with_dump=False,
              dump_dir=None, verbose=1):
@@ -243,6 +246,158 @@ class CaseInsensitiveDefaultDict(defaultdict):
 
     def __getitem__(self, key):
         return super(CaseInsensitiveDefaultDict, self).__getitem__(key.lower())
+
+
+class RandomSearch:
+    """The :class:`RandomSearch` class, used to evaluate the performance of an
+    algorithm on various combinations of parameters, and extract the best
+    combination.
+
+    See :ref:`User Guide <tuning_algorithm_parameters>` for usage.
+
+    Args:
+        algo_class(:obj:`AlgoBase \
+            <surprise.prediction_algorithms.algo_base.AlgoBase>`):
+            A class object of of the algorithm to evaluate.
+        param_grid (dict):
+            The dictionary has algo_class parameters as keys (string) and list
+            of parameters as the desired values to try.  All combinations will
+            be evaluated with desired algorithm.
+        n_iter(int):
+            The number of iterations for randomized search of hyper-parameters.
+        measures(list of string):
+            The performance measures to compute. Allowed names are function
+            names as defined in the :mod:`accuracy <surprise.accuracy>` module.
+            Default is ``['rmse', 'mae']``.
+        n_jobs(int):
+            The number of threads for parallel search.
+        verbose(int):
+            Level of verbosity. If ``0``, nothing is printed. If ``1``,
+            accuracy measures for each parameters combination are printed, with
+            combination values. If ``2``, folds accuracy values are also
+            printed.  Default is ``1``.
+
+    Attributes:
+        cv_results (dict of arrays):
+            A dict that contains all parameters and accuracy information for
+            each combination. Can  be imported into a pandas `DataFrame`.
+        best_estimator (dict of AlgoBase):
+            Using an accuracy measure as key, get the estimator that gave the
+            best accuracy results for the chosen measure.
+        best_score (dict of floats):
+            Using an accuracy measure as key, get the best score achieved for
+            that measure.
+        best_params (dict of dicts):
+            Using an accuracy measure as key, get the parameters combination
+            that gave the best accuracy results for the chosen measure.
+        best_index  (dict of ints):
+            Using an accuracy measure as key, get the index that can be used
+            with `cv_results_` that achieved the highest accuracy for that
+            measure.
+        """
+
+    def __init__(self, algo_class, param_grid, n_iter=5,
+                 measures=['rmse', 'mae'], n_jobs=-1, verbose=0):
+        self.best_params = CaseInsensitiveDefaultDict(list)
+        self.best_index = CaseInsensitiveDefaultDict(list)
+        self.best_score = CaseInsensitiveDefaultDict(list)
+        self.best_estimator = CaseInsensitiveDefaultDict(list)
+        self.cv_results = defaultdict(list)
+        self.algo_class = algo_class
+        self.param_grid = param_grid
+        self.measures = [measure.upper() for measure in measures]
+        self.verbose = verbose
+        self.param_combinations = \
+            list(ParameterSampler(param_grid, n_iter=n_iter))
+        self.n_jobs = n_jobs
+
+    def evaluate(self, data):
+        """Runs the grid search on dataset.
+
+        Class instance attributes can be accessed after the evaluate is done.
+
+        Args:
+            data (:obj:`Dataset <surprise.dataset.Dataset>`): The dataset on
+                which to evaluate the algorithm.
+        """
+
+        num_of_combinations = len(self.param_combinations)
+
+        # if self.verbose >= 1:
+        #     print('-' * 12)
+        #     print('Parameters combination {} of {}'.
+        #           format(combination_index + 1, num_of_combinations))
+        #     print('params: ', combination)
+
+        if self.verbose >= 1:
+            print("{} Parameter combinations: ".format(num_of_combinations))
+            for param in self.param_combinations:
+                print(param)
+
+        out = Parallel(
+            n_jobs=self.n_jobs,
+            verbose=self.verbose
+        )(delayed(_fit_and_score)(self.algo_class(**combination),
+                                  combination,
+                                  data,
+                                  self.measures,
+                                  # Turn off verbose output from _fit_and_score
+                                  # as the parallel run will mess up the order
+                                  # of output.
+                                  verbose=0)
+          for combination_index, combination
+          in enumerate(self.param_combinations))
+
+        params = []
+        scores = []
+        for result in out:
+            param, score = result
+            params.append(param)
+            scores.append(score)
+
+            if self.verbose >= 1:
+                print('------------')
+                print('param: ', param)
+                for measure in self.measures:
+                    print('Mean {0:4s}: {1:1.4f}'.format(
+                        measure, score[measure]))
+                print('------------')
+
+        self.cv_results['params'] = params
+        self.cv_results['scores'] = scores
+
+        # # Add accuracy measures and algorithm parameters as keys to dict
+        # for param, score in zip(params, scores):
+        #     for param_key, score_key in zip(param.keys(), score.keys()):
+        #         self.cv_results[param_key].append(param[param_key])
+        #         self.cv_results[score_key].append(score[score_key])
+
+        # # Get the best results
+        for measure in self.measures:
+            if measure == 'FCP':
+                best_dict = max(self.cv_results['scores'],
+                                key=lambda x: x[measure])
+            else:
+                best_dict = min(self.cv_results['scores'],
+                                key=lambda x: x[measure])
+            self.best_score[measure] = best_dict[measure]
+            self.best_index[measure] = self.cv_results['scores'].index(
+                best_dict)
+            self.best_params[measure] = self.cv_results['params'][
+                self.best_index[measure]]
+            self.best_estimator[measure] = self.algo_class(
+                **self.best_params[measure])
+
+
+def _fit_and_score(algo_instance, combination, data, measures, verbose):
+    evaluate_results = evaluate(algo_instance, data,
+                                measures=measures,
+                                verbose=0)
+    mean_score = {}
+    for measure in measures:
+        mean_score[measure] = np.mean(evaluate_results[measure])
+
+    return combination, mean_score
 
 
 def print_perf(performances):
